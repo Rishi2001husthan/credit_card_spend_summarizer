@@ -16,4 +16,7 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "python-multipart>=0.0.30",
     "uvicorn>=0.48.0",
+    "guardrails-ai>=0.10.2",
+    "cohere>=7.0.3",
+    "streamlit>=1.58.0",
 ]
