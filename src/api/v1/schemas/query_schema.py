@@ -7,16 +7,12 @@ class QueryRequest(BaseModel):
    query : str = Field(..., example="What is the minimum CIBIL score for personal loans?")
 
 
-
-
 class QueryResponse(BaseModel):
    query : str
    answer : str
    policy_citations : str
    page_no : str
    document_name : str
-
-
 
 
 class AIResponse(BaseModel):

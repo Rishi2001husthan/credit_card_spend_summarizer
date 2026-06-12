@@ -1,6 +1,8 @@
 import base64
 import io
 import os
+
+
 from dotenv import load_dotenv
 from docling.datamodel.base_models import InputFormat
 from langchain_core.messages import HumanMessage
@@ -15,23 +17,6 @@ from src.ingestion.image import get_image_description
 
 
 load_dotenv()
-
-
-# ---------------------------------------------------------------------------
-# Docling label taxonomy (DocItemLabel enum values we care about):
-#
-#   section_header  — numbered or unnumbered section headings
-#   title           — document-level title
-#   text / paragraph— body paragraphs
-#   list_item       — bullet / numbered list items
-#   caption         — figure / table captions (emitted as separate nodes)
-#   footnote        — footnotes at the bottom of a page
-#   table           — tabular data (Docling reconstructs cell structure)
-#   picture         — embedded raster / vector images
-#   chart           — chart/graph images (rendered image, no raw data)
-#   page_header     — running header printed on every page  ← NOISE, skipped
-#   page_footer     — running footer printed on every page  ← NOISE, skipped
-# ---------------------------------------------------------------------------
 
 
 def parse_document(file_path: str) -> list[dict]:
@@ -51,24 +36,13 @@ def parse_document(file_path: str) -> list[dict]:
    """
 
 
-   # ── Step 1: Configure Docling pipeline ───────────────────────────────────
-   # do_ocr=True          — run OCR on scanned/rasterised pages so text is
-   #                        extractable even when not embedded in the PDF
-   # do_table_structure   — detect table grid lines and reconstruct rows/cols
-   # generate_picture_images — render each picture element to a PIL Image so
-   #                           we can base64-encode it for storage
-   #
-   # accelerator_options — pin inference to CPU. On Apple Silicon the default
-   #   (AUTO) selects the MPS/Metal backend, but Docling's layout model runs in
-   #   float64 and MPS rejects float64 ("Cannot convert a MPS Tensor to float64
-   #   dtype"), crashing the layout stage. CPU supports float64, so forcing it
-   #   here keeps ingestion working on Macs. CUDA/CPU machines are unaffected.
    pipeline_options = PdfPipelineOptions(
        do_ocr=True,
        do_table_structure=True,
        generate_picture_images=True,
        accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
    )
+
 
    converter = DocumentConverter(
        allowed_formats=[InputFormat.PDF],
@@ -79,43 +53,32 @@ def parse_document(file_path: str) -> list[dict]:
 
 
    # ── Step 2: Convert the PDF ───────────────────────────────────────────────
-   # converter.convert() runs the full Docling pipeline:
-   #   layout analysis → OCR → table structure → picture rendering
-   # result.document is a DoclingDocument with a typed element tree.
    result = converter.convert(file_path)
    doc = result.document
 
+
    parsed_chunks: list[dict] = []
-   # Tracks the most recently seen section heading so every chunk carries
-   # the section name it belongs to — useful for filtered retrieval.
    current_section: str | None = None
    source_file = os.path.basename(file_path)
 
 
    # ── Step 3: Walk the document element tree ────────────────────────────────
-   # iterate_items() yields (level, node) tuples in Docling >= 2.x.
-   # level is the heading depth (1 = top-level); node is the DocItem.
    for item in doc.iterate_items():
        if isinstance(item, tuple):
            node, _ = item  # iterate_items() yields (node, level); discard level
        else:
            node = item     # older Docling versions yield bare nodes
 
-       # label is a DocItemLabel enum value — convert to lowercase string
-       # for pattern matching (e.g. "section_header", "table", "picture")
+
        label = str(getattr(node, "label", "")).lower()
 
+
        # ── Skip page headers/footers ─────────────────────────────────────────
-       # These repeat on every page (document title, page number, date stamp)
-       # and would pollute retrieval results with irrelevant noise.
        if label in ("page_header", "page_footer"):
            continue
 
+
        # ── Extract page number and bounding box from provenance ──────────────
-       # prov is a list of ProvenanceItem; prov[0] covers the first (usually
-       # only) occurrence of the element. bbox gives the element's position
-       # on the page as left/top/right/bottom coordinates (0–1 normalised or
-       # absolute, depending on Docling version).
        prov = getattr(node, "prov", None)
        page_no = prov[0].page_no if prov else None
        position: dict | None = None
@@ -146,8 +109,6 @@ def parse_document(file_path: str) -> list[dict]:
 
 
        # ── Section headings & document title ─────────────────────────────────
-       # Update current_section so all subsequent chunks carry the correct
-       # section name until the next heading is encountered.
        if "section_header" in label or label == "title":
            text = getattr(node, "text", "").strip()
            if text:
@@ -162,14 +123,6 @@ def parse_document(file_path: str) -> list[dict]:
 
 
        # ── Tables ────────────────────────────────────────────────────────────
-       # Convert table cells to clean "Header: value" plain text rows so
-       # that no markdown pipe/dash symbols pollute the vector store.
-       # Strategy:
-       #   1. export_to_dataframe() — preferred; yields a pandas DataFrame
-       #      with header row and typed cell values from Docling's grid.
-       #   2. Fallback: export_to_html() stripped of tags, then plain text.
-       # Each table row is serialised as "Col1: val1 | Col2: val2" so the
-       # column context travels with every value and embeddings are meaningful.
        elif "table" in label:
            table_text = ""
            if hasattr(node, "export_to_dataframe"):
@@ -201,9 +154,11 @@ def parse_document(file_path: str) -> list[dict]:
                except Exception:
                    pass
 
+
            # Last resort: raw text attribute
            if not table_text:
                table_text = getattr(node, "text", "")
+
 
            if table_text and table_text.strip():
                parsed_chunks.append(
@@ -216,18 +171,11 @@ def parse_document(file_path: str) -> list[dict]:
 
 
        # ── Pictures, figures, and charts ─────────────────────────────────────
-       # Charts are rendered images in Docling (no structured data is
-       # extracted), so they are handled identically to pictures.
-       # Extraction strategy:
-       #   1. get_image(doc) — preferred; uses pre-rendered PIL Images
-       #      produced when generate_picture_images=True
-       #   2. .image.pil_image — fallback attribute on some Docling versions
-       # The PIL Image is encoded as a base64 PNG and stored in metadata so
-       # the OpenAI vision model can receive it directly during generation.
        elif "picture" in label or "figure" in label or label == "chart":
            img_b64 = None
            # .text on a PictureItem is the inline caption, if any
            caption = getattr(node, "text", "") or ""
+
 
            try:
                if hasattr(node, "get_image"):
@@ -236,6 +184,7 @@ def parse_document(file_path: str) -> list[dict]:
                        buf = io.BytesIO()
                        pil_img.save(buf, format="PNG")
                        img_b64 = base64.b64encode(buf.getvalue()).decode()
+
 
                # Fallback path for older Docling versions
                if img_b64 is None and hasattr(node, "image") and node.image:
@@ -248,6 +197,7 @@ def parse_document(file_path: str) -> list[dict]:
                # Image extraction is best-effort; a missing image is not
                # fatal — the caption / placeholder text is still indexed.
                pass
+
 
            # Use an OpenAI vision model to generate a rich description for this
            # image. This becomes the chunk's searchable text content — far more
@@ -266,9 +216,8 @@ def parse_document(file_path: str) -> list[dict]:
                }
            )
 
+
        # ── Plain text: paragraphs, list items, captions, footnotes, etc. ─────
-       # Everything that is not a heading, table, or image falls here.
-       # Empty nodes (layout artefacts with no text) are silently dropped.
        else:
            text = getattr(node, "text", "")
            if text and text.strip():
@@ -279,5 +228,6 @@ def parse_document(file_path: str) -> list[dict]:
                        "metadata": _make_metadata("text", label),
                    }
                )
+
 
    return parsed_chunks
